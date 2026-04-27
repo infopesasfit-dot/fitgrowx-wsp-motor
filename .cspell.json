@@ -1,0 +1,5 @@
+{
+  "version": "0.2",
+  "language": "en,es",
+  "ignorePaths": ["node_modules", "auth"]
+}

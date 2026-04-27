@@ -1,0 +1,17 @@
+# Dependencias
+node_modules/
+
+# Variables de entorno (nunca subir al repo)
+.env
+.env.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# NOTA: la carpeta /auth está intencionalmente fuera de este .gitignore
+# para que Railway pueda montarla como Volume persistente.

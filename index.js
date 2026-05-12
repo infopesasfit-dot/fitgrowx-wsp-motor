@@ -5,6 +5,9 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 
+const WATCHDOG_INTERVAL_MS = 30 * 60 * 1000; // 30 min
+const ALERT_AFTER_MS       = 30 * 60 * 1000; // notificar al gym si lleva 30 min offline
+
 const app = express();
 app.use(cors({
   origin: '*',
@@ -17,12 +20,14 @@ const PORT = process.env.PORT || 8080;
 const DEFAULT_SESSION = process.env.SESSION_ID || 'default';
 
 // Estado por sesión
-const qrs        = {};          // id -> dataURL
-const statuses   = {};          // id -> 'disconnected' | 'connecting' | 'qr' | 'active'
-const sessions   = {};          // id -> sock
-const retries    = {};          // id -> number
-const initializing = new Set(); // ids en proceso de arranque
-const sseClients = {};          // id -> Set<res>
+const qrs              = {};          // id -> dataURL
+const statuses         = {};          // id -> 'disconnected' | 'connecting' | 'qr' | 'active'
+const sessions         = {};          // id -> sock
+const retries          = {};          // id -> number
+const initializing     = new Set();   // ids en proceso de arranque
+const sseClients       = {};          // id -> Set<res>
+const disconnectedSince = {};         // id -> timestamp (ms) cuando se desconectó
+const alertedDisconnect = new Set();  // ids a los que ya se notificó en este ciclo
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -152,6 +157,8 @@ async function initWA(id, wipeCreds = false) {
       statuses[id] = 'active';
       retries[id]  = 0;
       delete qrs[id];
+      delete disconnectedSince[id];
+      alertedDisconnect.delete(id);
       console.log(`[${id}] conectado`);
       broadcast(id, { status: 'active' });
       await saveSessionToSupabase(id);
@@ -160,6 +167,7 @@ async function initWA(id, wipeCreds = false) {
     if (connection === 'close') {
       delete sessions[id];
       statuses[id] = 'disconnected';
+      if (!disconnectedSince[id]) disconnectedSince[id] = Date.now();
       broadcast(id, { status: 'disconnected' });
 
       const code = lastDisconnect?.error?.output?.statusCode;
@@ -326,7 +334,7 @@ app.get('/qr/:id', (req, res) => {
 
 app.get(['/session-status', '/session-status/:id'], (req, res) => {
   const id = req.params.id || DEFAULT_SESSION;
-  res.json({ status: statuses[id] || 'disconnected' });
+  res.json({ status: statuses[id] || 'disconnected', retries: retries[id] || 0 });
 });
 
 app.post(['/restart', '/session/:id/restart'], (req, res) => {
@@ -347,6 +355,19 @@ app.delete('/session/:id', (req, res) => {
   initializing.delete(id);
   delete qrs[id];
   statuses[id] = 'disconnected';
+  res.json({ ok: true });
+});
+
+// Soft reconnect: cierra socket y reconecta sin borrar credenciales (no pide QR)
+app.post('/session/:id/reconnect', (req, res) => {
+  const id = req.params.id;
+  if (sessions[id]) { try { sessions[id].ws.close(); } catch (_) {} }
+  delete sessions[id];
+  initializing.delete(id);
+  delete qrs[id];
+  statuses[id] = 'disconnected';
+  retries[id] = 0;
+  setImmediate(() => initWA(id, false));
   res.json({ ok: true });
 });
 
@@ -411,6 +432,77 @@ app.post('/session/:id/restore', async (req, res) => {
 app.get('/health', (_req, res) => {
   res.json({ ok: true, sessions: statuses });
 });
+
+// ─── watchdog interno ────────────────────────────────────────────────────────
+
+async function notifyDisconnect(id) {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const serviceKey  = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!supabaseUrl || !serviceKey) return;
+
+  try {
+    // Anti-spam: no insertar si ya hay una notif sin leer en las últimas 2h
+    const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const check = await fetch(
+      `${supabaseUrl}/rest/v1/notifications?gym_id=eq.${id}&type=eq.wa_disconnected&read=eq.false&created_at=gte.${since}&select=id&limit=1`,
+      { headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` } }
+    );
+    const existing = await check.json();
+    if (Array.isArray(existing) && existing.length > 0) return;
+
+    await fetch(`${supabaseUrl}/rest/v1/notifications`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: serviceKey,
+        Authorization: `Bearer ${serviceKey}`,
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        gym_id: id,
+        type:   'wa_disconnected',
+        title:  '⚠️ Tu conexión de WhatsApp se cerró',
+        body:   'Lleva más de 30 minutos sin conexión. Ingresá para escanear el QR y reconectar.',
+        link:   '/dashboard/ajustes',
+        read:   false,
+      }),
+    });
+    console.log(`[watchdog][${id}] notificación wa_disconnected enviada`);
+  } catch (err) {
+    console.error(`[watchdog][${id}] error notificando: ${err.message}`);
+  }
+}
+
+setInterval(async () => {
+  const ids = Object.keys(statuses);
+  if (!ids.length) return;
+  console.log(`[watchdog] tick — ${ids.length} sesión(es): ${ids.map(id => `${id}:${statuses[id]}`).join(', ')}`);
+
+  for (const id of ids) {
+    const status = statuses[id];
+
+    // Sesión activa: nada que hacer
+    if (status === 'active') continue;
+
+    // Sesión en proceso de reconexión: darle tiempo
+    if (status === 'connecting' || initializing.has(id)) continue;
+
+    // Desconectada y sin reintento en curso: forzar reconexión
+    if (status === 'disconnected' && !sessions[id] && !initializing.has(id)) {
+      console.log(`[watchdog][${id}] desconectado — forzando reconexión`);
+      initWA(id, false);
+    }
+
+    // Si lleva más de ALERT_AFTER_MS desconectada, notificar al gym
+    const since = disconnectedSince[id];
+    if (since && Date.now() - since >= ALERT_AFTER_MS && !alertedDisconnect.has(id)) {
+      alertedDisconnect.add(id);
+      await notifyDisconnect(id);
+    }
+  }
+}, WATCHDOG_INTERVAL_MS);
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, async () => {
   console.log(`Servidor en puerto ${PORT}`);

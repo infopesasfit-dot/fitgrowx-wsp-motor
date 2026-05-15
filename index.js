@@ -12,6 +12,15 @@ const ARGENTINA_UTC_OFFSET   = -3;             // UTC-3, sin DST
 const BUSINESS_HOURS_START   = 8;              // 08:00 hora Argentina
 const BUSINESS_HOURS_END     = 22;             // 22:00 hora Argentina
 
+// ─── RAM alert ───────────────────────────────────────────────────────────────
+// Configurar WA_MOTOR_RAM_LIMIT_MB en Railway según el plan:
+//   Hobby  →  512   Pro Starter → 8192
+const RAM_LIMIT_MB          = parseInt(process.env.WA_MOTOR_RAM_LIMIT_MB || '512', 10);
+const RAM_CHECK_INTERVAL_MS = 5 * 60 * 1000;   // chequear cada 5 min
+const RAM_ALERT_COOLDOWN_MS = 4 * 60 * 60 * 1000; // máximo 1 alerta cada 4h
+let   lastRamAlertAt        = 0;
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ─── cola de envío por sesión ────────────────────────────────────────────────
 // Serializa todos los sendMessage de una sesión con delay aleatorio entre cada
 // uno para no disparar detección de bot de WhatsApp.
@@ -536,6 +545,19 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, sessions: statuses });
 });
 
+app.get('/metrics', (_req, res) => {
+  const mem = process.memoryUsage();
+  const toMB = b => Math.round(b / 1024 / 1024);
+  const activeSessions = Object.keys(statuses).filter(id => statuses[id] === 'active');
+  res.json({
+    rss_mb:          toMB(mem.rss),
+    heap_used_mb:    toMB(mem.heapUsed),
+    heap_total_mb:   toMB(mem.heapTotal),
+    sessions_total:  Object.keys(statuses).length,
+    sessions_active: activeSessions.length,
+  });
+});
+
 // ─── watchdog interno ────────────────────────────────────────────────────────
 
 function isBusinessHour() {
@@ -668,6 +690,29 @@ setInterval(async () => {
   }
 }, WATCHDOG_INTERVAL_MS);
 
+// ─── RAM monitor ─────────────────────────────────────────────────────────────
+setInterval(() => {
+  const rss_mb = Math.round(process.memoryUsage().rss / 1024 / 1024);
+  const pct    = rss_mb / RAM_LIMIT_MB;
+
+  console.log(`[ram] ${rss_mb}MB / ${RAM_LIMIT_MB}MB (${Math.round(pct * 100)}%)`);
+
+  if (pct < 0.80) return;
+
+  const now = Date.now();
+  if (now - lastRamAlertAt < RAM_ALERT_COOLDOWN_MS) return;
+  lastRamAlertAt = now;
+
+  const level   = pct >= 0.95 ? '🔴 CRÍTICO' : '🟡 ALERTA';
+  const active  = Object.keys(statuses).filter(id => statuses[id] === 'active').length;
+  const total   = Object.keys(statuses).length;
+  alertOwnerViaWA(
+    `${level} *WA Motor — RAM alta*\n` +
+    `${rss_mb}MB / ${RAM_LIMIT_MB}MB (${Math.round(pct * 100)}%)\n` +
+    `Sesiones: ${active} activas / ${total} totales\n\n` +
+    `Reiniciá en Railway si supera 95%.`
+  );
+}, RAM_CHECK_INTERVAL_MS);
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, async () => {

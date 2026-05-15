@@ -12,6 +12,36 @@ const ARGENTINA_UTC_OFFSET   = -3;             // UTC-3, sin DST
 const BUSINESS_HOURS_START   = 8;              // 08:00 hora Argentina
 const BUSINESS_HOURS_END     = 22;             // 22:00 hora Argentina
 
+// ─── cola de envío por sesión ────────────────────────────────────────────────
+// Serializa todos los sendMessage de una sesión con delay aleatorio entre cada
+// uno para no disparar detección de bot de WhatsApp.
+const SEND_DELAY_MIN_MS = 1200;  // mínimo entre mensajes
+const SEND_DELAY_MAX_MS = 4000;  // máximo entre mensajes
+
+const sendTails = {};  // id -> Promise (cola por sesión)
+
+function randomSendDelay() {
+  return Math.floor(Math.random() * (SEND_DELAY_MAX_MS - SEND_DELAY_MIN_MS)) + SEND_DELAY_MIN_MS;
+}
+
+function enqueueSend(id, jid, message) {
+  const tail = sendTails[id] ?? Promise.resolve();
+
+  const next = tail.then(async () => {
+    await new Promise(r => setTimeout(r, randomSendDelay()));
+    const sock = sessions[id];
+    if (!sock || statuses[id] !== 'active') {
+      throw new Error(`sesión no activa (${statuses[id] || 'disconnected'})`);
+    }
+    await sock.sendMessage(jid, { text: message });
+  });
+
+  // Solo guardamos el tail; los nodos resueltos los recoge el GC
+  sendTails[id] = next.catch(() => {});
+  return next;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 const app = express();
 app.use(cors({
   origin: '*',
@@ -86,10 +116,10 @@ function closeSession(id) {
   if (!sock) return;
   closingIntentional.add(id);
   try { sock.end(undefined); } catch (_) {
-    // fallback por si end() no existe en esta versión de Baileys
     try { sock.ws.close(); } catch (_2) {}
   }
   delete sessions[id];
+  delete sendTails[id];
 }
 
 function broadcast(id, payload) {
@@ -445,21 +475,20 @@ app.post('/session/:id/reconnect', (req, res) => {
   res.json({ ok: true });
 });
 
-// POST /send/:id — envía un mensaje de WhatsApp desde la sesión activa
+// POST /send/:id — envía un mensaje vía cola serializada con delay aleatorio
 app.post('/send/:id', async (req, res) => {
   const id  = req.params.id;
   const { phone, message } = req.body;
 
   if (!phone || !message) return res.status(400).json({ error: 'phone y message requeridos' });
 
-  const sock = sessions[id];
-  if (!sock || statuses[id] !== 'active') {
+  if (!sessions[id] || statuses[id] !== 'active') {
     return res.status(503).json({ error: 'sesión no activa', status: statuses[id] || 'disconnected' });
   }
 
   try {
     const jid = phone.replace(/[^0-9]/g, '') + '@s.whatsapp.net';
-    await sock.sendMessage(jid, { text: message });
+    await enqueueSend(id, jid, message);
     res.json({ ok: true });
   } catch (err) {
     console.error(`[${id}] send error: ${err.message}`);

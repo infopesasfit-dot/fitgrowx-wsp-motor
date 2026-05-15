@@ -819,7 +819,7 @@ setInterval(() => {
 }, RAM_CHECK_INTERVAL_MS);
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.listen(PORT, async () => {
+const server = app.listen(PORT, async () => {
   console.log(`Servidor en puerto ${PORT}`);
 
   // Restaurar todas las sesiones guardadas en Supabase al arrancar
@@ -865,3 +865,43 @@ app.listen(PORT, async () => {
     initWA(DEFAULT_SESSION);
   }
 });
+
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
+// Railway manda SIGTERM antes de matar el proceso. Tenemos ~10s antes del SIGKILL.
+// Usamos 8s: 5s para guardar sesiones + 2s para cerrar sockets + 1s de buffer.
+
+async function gracefulShutdown(signal) {
+  console.log(`[shutdown] ${signal} recibido — cerrando ordenadamente`);
+
+  // Safety net: si tardamos más de 8s, Railway nos mata igual; salimos antes con code 1
+  const forceExit = setTimeout(() => {
+    console.error('[shutdown] timeout de 8s alcanzado — forzando salida');
+    process.exit(1);
+  }, 8000);
+  forceExit.unref(); // no bloquea el event loop si el shutdown termina antes
+
+  // 1. Dejar de aceptar nuevas conexiones HTTP
+  server.close();
+
+  // 2. Cancelar timers de debounce pendientes y guardar inmediatamente
+  for (const id of Object.keys(saveDebounceTimers)) {
+    clearTimeout(saveDebounceTimers[id]);
+    delete saveDebounceTimers[id];
+  }
+
+  // 3. Guardar todas las sesiones activas en Supabase en paralelo
+  const activeIds = Object.keys(statuses).filter(id => statuses[id] === 'active');
+  console.log(`[shutdown] guardando ${activeIds.length} sesión(es) activa(s) en Supabase...`);
+  await Promise.allSettled(activeIds.map(id => saveSessionToSupabase(id)));
+
+  // 4. Cerrar sockets de Baileys ordenadamente
+  for (const id of Object.keys(sessions)) closeSession(id);
+
+  console.log('[shutdown] cierre completado — saliendo');
+  clearTimeout(forceExit);
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
+process.on('SIGINT',  () => { void gracefulShutdown('SIGINT');  });
+// ─────────────────────────────────────────────────────────────────────────────

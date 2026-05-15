@@ -139,6 +139,20 @@ function broadcast(id, payload) {
 }
 
 // ─── supabase session save ───────────────────────────────────────────────────
+// Guarda TODOS los archivos del directorio auth_<id>/ como un objeto JSON.
+// Formato: { "creds.json": "...", "pre-key-1.json": "...", ... }
+// Esto permite restaurar el estado completo de Baileys (signal keys incluidas)
+// después de un redeploy, sin perder la sesión.
+
+const saveDebounceTimers = {};
+
+function debouncedSave(id, delayMs = 3000) {
+  clearTimeout(saveDebounceTimers[id]);
+  saveDebounceTimers[id] = setTimeout(() => {
+    delete saveDebounceTimers[id];
+    saveSessionToSupabase(id).catch(err => console.error(`[${id}] debouncedSave error: ${err.message}`));
+  }, delayMs);
+}
 
 async function saveSessionToSupabase(id) {
   const supabaseUrl = process.env.SUPABASE_URL;
@@ -148,37 +162,74 @@ async function saveSessionToSupabase(id) {
     return;
   }
   try {
-    const credsPath = path.join(authDir(id), 'creds.json');
-    let creds_json  = fs.existsSync(credsPath) ? fs.readFileSync(credsPath, 'utf8') : null;
-    // No persistir un JSON corrupto: un write parcial de Baileys produciría
-    // que el próximo boot restaure basura y rompa la sesión al arrancar.
-    if (creds_json) { try { JSON.parse(creds_json); } catch { creds_json = null; } }
-    if (!creds_json) { console.warn(`[${id}] saveSessionToSupabase: creds.json ausente o inválido — omitiendo`); return; }
+    const dir = authDir(id);
+    if (!fs.existsSync(dir)) { console.warn(`[${id}] saveSessionToSupabase: directorio ausente`); return; }
 
-    // Guardar sesión individual por gym — un reintento si falla
-    const savePayload = JSON.stringify({ gym_id: id, creds_json, updated_at: new Date().toISOString() });
+    const files = fs.readdirSync(dir).filter(f => f.endsWith('.json'));
+    if (!files.length) { console.warn(`[${id}] saveSessionToSupabase: sin archivos JSON`); return; }
+
+    const authState = {};
+    for (const file of files) {
+      const raw = fs.readFileSync(path.join(dir, file), 'utf8');
+      try { JSON.parse(raw); authState[file] = raw; } catch { console.warn(`[${id}] archivo inválido ignorado: ${file}`); }
+    }
+
+    if (!authState['creds.json']) { console.warn(`[${id}] saveSessionToSupabase: creds.json ausente — omitiendo`); return; }
+
+    const creds_json  = JSON.stringify(authState);
     const saveHeaders = { 'Content-Type': 'application/json', 'apikey': serviceKey, 'Authorization': `Bearer ${serviceKey}`, 'Prefer': 'resolution=merge-duplicates' };
-    let r1 = await fetch(`${supabaseUrl}/rest/v1/whatsapp_sessions`, { method: 'POST', headers: saveHeaders, body: savePayload });
+    let r1 = await fetch(`${supabaseUrl}/rest/v1/whatsapp_sessions`, {
+      method: 'POST', headers: saveHeaders,
+      body: JSON.stringify({ gym_id: id, creds_json, updated_at: new Date().toISOString() }),
+    });
     if (!r1.ok) {
       await new Promise(r => setTimeout(r, 3000));
-      r1 = await fetch(`${supabaseUrl}/rest/v1/whatsapp_sessions`, { method: 'POST', headers: saveHeaders, body: savePayload });
+      r1 = await fetch(`${supabaseUrl}/rest/v1/whatsapp_sessions`, {
+        method: 'POST', headers: saveHeaders,
+        body: JSON.stringify({ gym_id: id, creds_json, updated_at: new Date().toISOString() }),
+      });
     }
-    console.log(`[${id}] whatsapp_sessions → HTTP ${r1.status}`);
+    console.log(`[${id}] whatsapp_sessions → HTTP ${r1.status} (${files.length} archivos)`);
 
-    // Marcar whatsapp_connected = true en gym_settings
     const r2 = await fetch(`${supabaseUrl}/rest/v1/gym_settings?gym_id=eq.${id}`, {
       method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': serviceKey,
-        'Authorization': `Bearer ${serviceKey}`,
-      },
+      headers: { 'Content-Type': 'application/json', 'apikey': serviceKey, 'Authorization': `Bearer ${serviceKey}` },
       body: JSON.stringify({ whatsapp_connected: true }),
     });
     console.log(`[${id}] gym_settings whatsapp_connected → HTTP ${r2.status}`);
   } catch (err) {
     console.error(`[${id}] saveSessionToSupabase error: ${err.message}`);
   }
+}
+
+// Restaura todos los archivos del auth state desde creds_json guardado.
+// Soporta formato viejo (string plano de creds.json) y nuevo (objeto con todos los archivos).
+function restoreAuthFromJson(gymId, raw) {
+  ensureAuth(gymId);
+  const dir = authDir(gymId);
+
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch {
+    console.error(`[boot] creds_json corrupto para gym ${gymId}`);
+    return false;
+  }
+
+  // Nuevo formato: { "creds.json": "...", "pre-key-1.json": "...", ... }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed['creds.json']) {
+    let written = 0;
+    for (const [filename, content] of Object.entries(parsed)) {
+      if (typeof content !== 'string') continue;
+      try { JSON.parse(content); fs.writeFileSync(path.join(dir, filename), content, 'utf8'); written++; } catch { console.warn(`[boot] ${gymId}/${filename} inválido — omitido`); }
+    }
+    console.log(`[boot] ${gymId}: ${written} archivos restaurados`);
+    return true;
+  }
+
+  // Formato viejo: string con el contenido de creds.json
+  try { JSON.parse(raw); } catch { console.error(`[boot] creds.json corrupto para gym ${gymId}`); return false; }
+  fs.writeFileSync(path.join(dir, 'creds.json'), raw, 'utf8');
+  console.log(`[boot] ${gymId}: creds.json restaurado (formato legado)`);
+  return true;
 }
 
 // ─── core ────────────────────────────────────────────────────────────────────
@@ -229,7 +280,7 @@ async function initWA(id, wipeCreds = false) {
 
   sock.ev.on('creds.update', async () => {
     await saveCreds();
-    if (statuses[id] === 'active') await saveSessionToSupabase(id);
+    if (statuses[id] === 'active') debouncedSave(id);
   });
 
   sock.ev.on('connection.update', async (update) => {
@@ -523,13 +574,10 @@ app.post('/session/:id/restore', async (req, res) => {
   }
 
   try {
-    ensureAuth(id);
-    const credsPath = path.join(authDir(id), 'creds.json');
-    const content   = typeof creds_json === 'string' ? creds_json : JSON.stringify(creds_json);
-    fs.writeFileSync(credsPath, content, 'utf8');
-    console.log(`[${id}] creds.json restaurado desde Supabase`);
+    const raw = typeof creds_json === 'string' ? creds_json : JSON.stringify(creds_json);
+    const ok  = restoreAuthFromJson(id, raw);
+    if (!ok) return res.status(400).json({ error: 'creds_json inválido o corrupto' });
 
-    // Arrancar sesión con las credenciales restauradas
     if (!sessions[id] && !initializing.has(id)) {
       setImmediate(() => initWA(id, false));
     }
@@ -690,6 +738,16 @@ setInterval(async () => {
   }
 }, WATCHDOG_INTERVAL_MS);
 
+// ─── Periodic full auth save ─────────────────────────────────────────────────
+// Captura signal keys y otros archivos que Baileys escribe directamente al disco
+// sin disparar el evento creds.update.
+setInterval(() => {
+  for (const id of Object.keys(statuses)) {
+    if (statuses[id] === 'active') debouncedSave(id, 0);
+  }
+}, 10 * 60 * 1000);
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ─── RAM monitor ─────────────────────────────────────────────────────────────
 setInterval(() => {
   const rss_mb = Math.round(process.memoryUsage().rss / 1024 / 1024);
@@ -736,21 +794,13 @@ app.listen(PORT, async () => {
         for (const row of rows) {
           if (!row.gym_id || !row.creds_json) continue;
           try {
-            // Validar que el JSON sea parseable antes de escribirlo al disco.
-            // Un creds_json corrupto en Supabase haría que useMultiFileAuthState
-            // lanzara en initWA, que ahora detiene la sesión en needs_reauth.
-            // Detectarlo aquí es más rápido y da un log más claro.
-            const content = typeof row.creds_json === 'string' ? row.creds_json : JSON.stringify(row.creds_json);
-            try { JSON.parse(content); } catch {
-              console.error(`[boot] creds_json corrupto para gym ${row.gym_id} — marcando needs_reauth`);
+            const raw = typeof row.creds_json === 'string' ? row.creds_json : JSON.stringify(row.creds_json);
+            const ok  = restoreAuthFromJson(row.gym_id, raw);
+            if (!ok) {
               statuses[row.gym_id] = 'needs_reauth';
               notifyCritical(row.gym_id);
               continue;
             }
-            ensureAuth(row.gym_id);
-            const credsPath = path.join(authDir(row.gym_id), 'creds.json');
-            fs.writeFileSync(credsPath, content, 'utf8');
-            console.log(`[boot] creds restauradas para gym ${row.gym_id}`);
             enqueueInit(row.gym_id, false);
           } catch (err) {
             console.error(`[boot] error restaurando ${row.gym_id}: ${err.message}`);

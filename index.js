@@ -3,6 +3,7 @@ const express = require('express');
 const qrcode = require('qrcode');
 const cors = require('cors');
 const fs = require('fs');
+const crypto = require('crypto');
 const path = require('path');
 
 const WATCHDOG_INTERVAL_MS   = 30 * 60 * 1000; // 30 min
@@ -138,6 +139,45 @@ function broadcast(id, payload) {
   set.forEach(res => { try { res.write(msg); } catch (_) {} });
 }
 
+// ─── encryption at rest ──────────────────────────────────────────────────────
+// AES-256-GCM. Requiere WA_SESSION_ENCRYPTION_KEY = 64 hex chars (32 bytes).
+// Generar con: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+// Si la variable no está definida → guarda en texto plano (fallback).
+// Formato cifrado: "enc:v1:<iv_hex>:<authTag_hex>:<ciphertext_hex>"
+
+function encryptSession(plaintext) {
+  const keyHex = process.env.WA_SESSION_ENCRYPTION_KEY;
+  if (!keyHex) return plaintext;
+
+  const key        = Buffer.from(keyHex, 'hex');
+  const iv         = crypto.randomBytes(16);
+  const cipher     = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted  = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const authTag    = cipher.getAuthTag();
+
+  return `enc:v1:${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted.toString('hex')}`;
+}
+
+function decryptSession(value) {
+  if (!value.startsWith('enc:v1:')) return value; // texto plano (legado o sin clave)
+
+  const keyHex = process.env.WA_SESSION_ENCRYPTION_KEY;
+  if (!keyHex) throw new Error('WA_SESSION_ENCRYPTION_KEY no configurado pero el dato está cifrado');
+
+  const parts = value.split(':');
+  if (parts.length !== 5) throw new Error('Formato cifrado inválido');
+
+  const key        = Buffer.from(keyHex, 'hex');
+  const iv         = Buffer.from(parts[2], 'hex');
+  const authTag    = Buffer.from(parts[3], 'hex');
+  const ciphertext = Buffer.from(parts[4], 'hex');
+
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(authTag);
+  return decipher.update(ciphertext) + decipher.final('utf8');
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ─── supabase session save ───────────────────────────────────────────────────
 // Guarda TODOS los archivos del directorio auth_<id>/ como un objeto JSON.
 // Formato: { "creds.json": "...", "pre-key-1.json": "...", ... }
@@ -176,7 +216,7 @@ async function saveSessionToSupabase(id) {
 
     if (!authState['creds.json']) { console.warn(`[${id}] saveSessionToSupabase: creds.json ausente — omitiendo`); return; }
 
-    const creds_json  = JSON.stringify(authState);
+    const creds_json  = encryptSession(JSON.stringify(authState));
     const saveHeaders = { 'Content-Type': 'application/json', 'apikey': serviceKey, 'Authorization': `Bearer ${serviceKey}`, 'Prefer': 'resolution=merge-duplicates' };
     let r1 = await fetch(`${supabaseUrl}/rest/v1/whatsapp_sessions`, {
       method: 'POST', headers: saveHeaders,
@@ -208,8 +248,14 @@ function restoreAuthFromJson(gymId, raw) {
   ensureAuth(gymId);
   const dir = authDir(gymId);
 
+  let decrypted;
+  try { decrypted = decryptSession(raw); } catch (err) {
+    console.error(`[boot] error descifrando sesión de ${gymId}: ${err.message}`);
+    return false;
+  }
+
   let parsed;
-  try { parsed = JSON.parse(raw); } catch {
+  try { parsed = JSON.parse(decrypted); } catch {
     console.error(`[boot] creds_json corrupto para gym ${gymId}`);
     return false;
   }
@@ -226,8 +272,8 @@ function restoreAuthFromJson(gymId, raw) {
   }
 
   // Formato viejo: string con el contenido de creds.json
-  try { JSON.parse(raw); } catch { console.error(`[boot] creds.json corrupto para gym ${gymId}`); return false; }
-  fs.writeFileSync(path.join(dir, 'creds.json'), raw, 'utf8');
+  try { JSON.parse(decrypted); } catch { console.error(`[boot] creds.json corrupto para gym ${gymId}`); return false; }
+  fs.writeFileSync(path.join(dir, 'creds.json'), decrypted, 'utf8');
   console.log(`[boot] ${gymId}: creds.json restaurado (formato legado)`);
   return true;
 }
